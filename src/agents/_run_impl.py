@@ -28,6 +28,9 @@ from openai.types.responses.response_computer_tool_call import (
     ActionType,
     ActionWait,
 )
+from openai.types.responses.response_input_item_param import (
+    ComputerCallOutputAcknowledgedSafetyCheck,
+)
 from openai.types.responses.response_input_param import ComputerCallOutput, McpApprovalResponse
 from openai.types.responses.response_output_item import (
     ImageGenerationCall,
@@ -41,7 +44,13 @@ from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 from .agent import Agent, ToolsToFinalOutputResult
 from .agent_output import AgentOutputSchemaBase
 from .computer import AsyncComputer, Computer
-from .exceptions import AgentsException, ModelBehaviorError, UserError
+from .exceptions import (
+    AgentsException,
+    ModelBehaviorError,
+    ToolInputGuardrailTripwireTriggered,
+    ToolOutputGuardrailTripwireTriggered,
+    UserError,
+)
 from .guardrail import InputGuardrail, InputGuardrailResult, OutputGuardrail, OutputGuardrailResult
 from .handoffs import Handoff, HandoffInputData
 from .items import (
@@ -67,6 +76,7 @@ from .run_context import RunContextWrapper, TContext
 from .stream_events import RunItemStreamEvent, StreamEvent
 from .tool import (
     ComputerTool,
+    ComputerToolSafetyCheckData,
     FunctionTool,
     FunctionToolResult,
     HostedMCPTool,
@@ -76,6 +86,12 @@ from .tool import (
     Tool,
 )
 from .tool_context import ToolContext
+from .tool_guardrails import (
+    ToolInputGuardrailData,
+    ToolInputGuardrailResult,
+    ToolOutputGuardrailData,
+    ToolOutputGuardrailResult,
+)
 from .tracing import (
     SpanError,
     Trace,
@@ -204,6 +220,12 @@ class SingleStepResult:
     next_step: NextStepHandoff | NextStepFinalOutput | NextStepRunAgain
     """The next step to take."""
 
+    tool_input_guardrail_results: list[ToolInputGuardrailResult]
+    """Tool input guardrail results from this step."""
+
+    tool_output_guardrail_results: list[ToolOutputGuardrailResult]
+    """Tool output guardrail results from this step."""
+
     @property
     def generated_items(self) -> list[RunItem]:
         """Items generated during the agent run (i.e. everything generated after
@@ -246,7 +268,10 @@ class RunImpl:
         new_step_items.extend(processed_response.new_items)
 
         # First, lets run the tool calls - function tools and computer actions
-        function_results, computer_results = await asyncio.gather(
+        (
+            (function_results, tool_input_guardrail_results, tool_output_guardrail_results),
+            computer_results,
+        ) = await asyncio.gather(
             cls.execute_function_tool_calls(
                 agent=agent,
                 tool_runs=processed_response.functions,
@@ -316,6 +341,8 @@ class RunImpl:
                 final_output=check_tool_use.final_output,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
+                tool_input_guardrail_results=tool_input_guardrail_results,
+                tool_output_guardrail_results=tool_output_guardrail_results,
             )
 
         # Now we can check if the model also produced a final output
@@ -326,43 +353,46 @@ class RunImpl:
             ItemHelpers.extract_last_text(message_items[-1].raw_item) if message_items else None
         )
 
-        # There are two possibilities that lead to a final output:
-        # 1. Structured output schema => always leads to a final output
-        # 2. Plain text output schema => only leads to a final output if there are no tool calls
-        if output_schema and not output_schema.is_plain_text() and potential_final_output_text:
-            final_output = output_schema.validate_json(potential_final_output_text)
-            return await cls.execute_final_output(
-                agent=agent,
-                original_input=original_input,
-                new_response=new_response,
-                pre_step_items=pre_step_items,
-                new_step_items=new_step_items,
-                final_output=final_output,
-                hooks=hooks,
-                context_wrapper=context_wrapper,
-            )
-        elif (
-            not output_schema or output_schema.is_plain_text()
-        ) and not processed_response.has_tools_or_approvals_to_run():
-            return await cls.execute_final_output(
-                agent=agent,
-                original_input=original_input,
-                new_response=new_response,
-                pre_step_items=pre_step_items,
-                new_step_items=new_step_items,
-                final_output=potential_final_output_text or "",
-                hooks=hooks,
-                context_wrapper=context_wrapper,
-            )
-        else:
-            # If there's no final output, we can just run again
-            return SingleStepResult(
-                original_input=original_input,
-                model_response=new_response,
-                pre_step_items=pre_step_items,
-                new_step_items=new_step_items,
-                next_step=NextStepRunAgain(),
-            )
+        # Generate final output only when there are no pending tool calls or approval requests.
+        if not processed_response.has_tools_or_approvals_to_run():
+            if output_schema and not output_schema.is_plain_text() and potential_final_output_text:
+                final_output = output_schema.validate_json(potential_final_output_text)
+                return await cls.execute_final_output(
+                    agent=agent,
+                    original_input=original_input,
+                    new_response=new_response,
+                    pre_step_items=pre_step_items,
+                    new_step_items=new_step_items,
+                    final_output=final_output,
+                    hooks=hooks,
+                    context_wrapper=context_wrapper,
+                    tool_input_guardrail_results=tool_input_guardrail_results,
+                    tool_output_guardrail_results=tool_output_guardrail_results,
+                )
+            elif not output_schema or output_schema.is_plain_text():
+                return await cls.execute_final_output(
+                    agent=agent,
+                    original_input=original_input,
+                    new_response=new_response,
+                    pre_step_items=pre_step_items,
+                    new_step_items=new_step_items,
+                    final_output=potential_final_output_text or "",
+                    hooks=hooks,
+                    context_wrapper=context_wrapper,
+                    tool_input_guardrail_results=tool_input_guardrail_results,
+                    tool_output_guardrail_results=tool_output_guardrail_results,
+                )
+
+        # If there's no final output, we can just run again
+        return SingleStepResult(
+            original_input=original_input,
+            model_response=new_response,
+            pre_step_items=pre_step_items,
+            new_step_items=new_step_items,
+            next_step=NextStepRunAgain(),
+            tool_input_guardrail_results=tool_input_guardrail_results,
+            tool_output_guardrail_results=tool_output_guardrail_results,
+        )
 
     @classmethod
     def maybe_reset_tool_choice(
@@ -505,13 +535,29 @@ class RunImpl:
             # Regular function tool call
             else:
                 if output.name not in function_map:
-                    _error_tracing.attach_error_to_current_span(
-                        SpanError(
-                            message="Tool not found",
-                            data={"tool_name": output.name},
+                    if output_schema is not None and output.name == "json_tool_call":
+                        # LiteLLM could generate non-existent tool calls for structured outputs
+                        items.append(ToolCallItem(raw_item=output, agent=agent))
+                        functions.append(
+                            ToolRunFunction(
+                                tool_call=output,
+                                # this tool does not exist in function_map, so generate ad-hoc one,
+                                # which just parses the input if it's a string, and returns the
+                                # value otherwise
+                                function_tool=_build_litellm_json_tool_call(output),
+                            )
                         )
-                    )
-                    raise ModelBehaviorError(f"Tool {output.name} not found in agent {agent.name}")
+                        continue
+                    else:
+                        _error_tracing.attach_error_to_current_span(
+                            SpanError(
+                                message="Tool not found",
+                                data={"tool_name": output.name},
+                            )
+                        )
+                        error = f"Tool {output.name} not found in agent {agent.name}"
+                        raise ModelBehaviorError(error)
+
                 items.append(ToolCallItem(raw_item=output, agent=agent))
                 functions.append(
                     ToolRunFunction(
@@ -531,6 +577,155 @@ class RunImpl:
         )
 
     @classmethod
+    async def _execute_input_guardrails(
+        cls,
+        *,
+        func_tool: FunctionTool,
+        tool_context: ToolContext[TContext],
+        agent: Agent[TContext],
+        tool_input_guardrail_results: list[ToolInputGuardrailResult],
+    ) -> str | None:
+        """Execute input guardrails for a tool.
+
+        Args:
+            func_tool: The function tool being executed.
+            tool_context: The tool execution context.
+            agent: The agent executing the tool.
+            tool_input_guardrail_results: List to append guardrail results to.
+
+        Returns:
+            None if tool execution should proceed, or a message string if execution should be
+            skipped.
+
+        Raises:
+            ToolInputGuardrailTripwireTriggered: If a guardrail triggers an exception.
+        """
+        if not func_tool.tool_input_guardrails:
+            return None
+
+        for guardrail in func_tool.tool_input_guardrails:
+            gr_out = await guardrail.run(
+                ToolInputGuardrailData(
+                    context=tool_context,
+                    agent=agent,
+                )
+            )
+
+            # Store the guardrail result
+            tool_input_guardrail_results.append(
+                ToolInputGuardrailResult(
+                    guardrail=guardrail,
+                    output=gr_out,
+                )
+            )
+
+            # Handle different behavior types
+            if gr_out.behavior["type"] == "raise_exception":
+                raise ToolInputGuardrailTripwireTriggered(guardrail=guardrail, output=gr_out)
+            elif gr_out.behavior["type"] == "reject_content":
+                # Set final_result to the message and skip tool execution
+                return gr_out.behavior["message"]
+            elif gr_out.behavior["type"] == "allow":
+                # Continue to next guardrail or tool execution
+                continue
+
+        return None
+
+    @classmethod
+    async def _execute_output_guardrails(
+        cls,
+        *,
+        func_tool: FunctionTool,
+        tool_context: ToolContext[TContext],
+        agent: Agent[TContext],
+        real_result: Any,
+        tool_output_guardrail_results: list[ToolOutputGuardrailResult],
+    ) -> Any:
+        """Execute output guardrails for a tool.
+
+        Args:
+            func_tool: The function tool being executed.
+            tool_context: The tool execution context.
+            agent: The agent executing the tool.
+            real_result: The actual result from the tool execution.
+            tool_output_guardrail_results: List to append guardrail results to.
+
+        Returns:
+            The final result after guardrail processing (may be modified).
+
+        Raises:
+            ToolOutputGuardrailTripwireTriggered: If a guardrail triggers an exception.
+        """
+        if not func_tool.tool_output_guardrails:
+            return real_result
+
+        final_result = real_result
+        for output_guardrail in func_tool.tool_output_guardrails:
+            gr_out = await output_guardrail.run(
+                ToolOutputGuardrailData(
+                    context=tool_context,
+                    agent=agent,
+                    output=real_result,
+                )
+            )
+
+            # Store the guardrail result
+            tool_output_guardrail_results.append(
+                ToolOutputGuardrailResult(
+                    guardrail=output_guardrail,
+                    output=gr_out,
+                )
+            )
+
+            # Handle different behavior types
+            if gr_out.behavior["type"] == "raise_exception":
+                raise ToolOutputGuardrailTripwireTriggered(
+                    guardrail=output_guardrail, output=gr_out
+                )
+            elif gr_out.behavior["type"] == "reject_content":
+                # Override the result with the guardrail message
+                final_result = gr_out.behavior["message"]
+                break
+            elif gr_out.behavior["type"] == "allow":
+                # Continue to next guardrail
+                continue
+
+        return final_result
+
+    @classmethod
+    async def _execute_tool_with_hooks(
+        cls,
+        *,
+        func_tool: FunctionTool,
+        tool_context: ToolContext[TContext],
+        agent: Agent[TContext],
+        hooks: RunHooks[TContext],
+        tool_call: ResponseFunctionToolCall,
+    ) -> Any:
+        """Execute the core tool function with before/after hooks.
+
+        Args:
+            func_tool: The function tool being executed.
+            tool_context: The tool execution context.
+            agent: The agent executing the tool.
+            hooks: The run hooks to execute.
+            tool_call: The tool call details.
+
+        Returns:
+            The result from the tool execution.
+        """
+        await asyncio.gather(
+            hooks.on_tool_start(tool_context, agent, func_tool),
+            (
+                agent.hooks.on_tool_start(tool_context, agent, func_tool)
+                if agent.hooks
+                else _coro.noop_coroutine()
+            ),
+        )
+
+        return await func_tool.on_invoke_tool(tool_context, tool_call.arguments)
+
+    @classmethod
     async def execute_function_tool_calls(
         cls,
         *,
@@ -539,33 +734,67 @@ class RunImpl:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         config: RunConfig,
-    ) -> list[FunctionToolResult]:
+    ) -> tuple[
+        list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult]
+    ]:
+        # Collect guardrail results
+        tool_input_guardrail_results: list[ToolInputGuardrailResult] = []
+        tool_output_guardrail_results: list[ToolOutputGuardrailResult] = []
+
         async def run_single_tool(
             func_tool: FunctionTool, tool_call: ResponseFunctionToolCall
         ) -> Any:
             with function_span(func_tool.name) as span_fn:
-                tool_context = ToolContext.from_agent_context(context_wrapper, tool_call.call_id)
+                tool_context = ToolContext.from_agent_context(
+                    context_wrapper,
+                    tool_call.call_id,
+                    tool_call=tool_call,
+                )
                 if config.trace_include_sensitive_data:
                     span_fn.span_data.input = tool_call.arguments
                 try:
-                    _, _, result = await asyncio.gather(
-                        hooks.on_tool_start(tool_context, agent, func_tool),
-                        (
-                            agent.hooks.on_tool_start(tool_context, agent, func_tool)
-                            if agent.hooks
-                            else _coro.noop_coroutine()
-                        ),
-                        func_tool.on_invoke_tool(tool_context, tool_call.arguments),
+                    # 1) Run input tool guardrails, if any
+                    rejected_message = await cls._execute_input_guardrails(
+                        func_tool=func_tool,
+                        tool_context=tool_context,
+                        agent=agent,
+                        tool_input_guardrail_results=tool_input_guardrail_results,
                     )
 
-                    await asyncio.gather(
-                        hooks.on_tool_end(tool_context, agent, func_tool, result),
-                        (
-                            agent.hooks.on_tool_end(tool_context, agent, func_tool, result)
-                            if agent.hooks
-                            else _coro.noop_coroutine()
-                        ),
-                    )
+                    if rejected_message is not None:
+                        # Input guardrail rejected the tool call
+                        final_result = rejected_message
+                    else:
+                        # 2) Actually run the tool
+                        real_result = await cls._execute_tool_with_hooks(
+                            func_tool=func_tool,
+                            tool_context=tool_context,
+                            agent=agent,
+                            hooks=hooks,
+                            tool_call=tool_call,
+                        )
+
+                        # 3) Run output tool guardrails, if any
+                        final_result = await cls._execute_output_guardrails(
+                            func_tool=func_tool,
+                            tool_context=tool_context,
+                            agent=agent,
+                            real_result=real_result,
+                            tool_output_guardrail_results=tool_output_guardrail_results,
+                        )
+
+                        # 4) Tool end hooks (with final result, which may have been overridden)
+                        await asyncio.gather(
+                            hooks.on_tool_end(tool_context, agent, func_tool, final_result),
+                            (
+                                agent.hooks.on_tool_end(
+                                    tool_context, agent, func_tool, final_result
+                                )
+                                if agent.hooks
+                                else _coro.noop_coroutine()
+                            ),
+                        )
+                    result = final_result
                 except Exception as e:
                     _error_tracing.attach_error_to_current_span(
                         SpanError(
@@ -588,7 +817,7 @@ class RunImpl:
 
         results = await asyncio.gather(*tasks)
 
-        return [
+        function_tool_results = [
             FunctionToolResult(
                 tool=tool_run.function_tool,
                 output=result,
@@ -600,6 +829,8 @@ class RunImpl:
             )
             for tool_run, result in zip(tool_runs, results)
         ]
+
+        return function_tool_results, tool_input_guardrail_results, tool_output_guardrail_results
 
     @classmethod
     async def execute_local_shell_calls(
@@ -638,6 +869,29 @@ class RunImpl:
         results: list[RunItem] = []
         # Need to run these serially, because each action can affect the computer state
         for action in actions:
+            acknowledged: list[ComputerCallOutputAcknowledgedSafetyCheck] | None = None
+            if action.tool_call.pending_safety_checks and action.computer_tool.on_safety_check:
+                acknowledged = []
+                for check in action.tool_call.pending_safety_checks:
+                    data = ComputerToolSafetyCheckData(
+                        ctx_wrapper=context_wrapper,
+                        agent=agent,
+                        tool_call=action.tool_call,
+                        safety_check=check,
+                    )
+                    maybe = action.computer_tool.on_safety_check(data)
+                    ack = await maybe if inspect.isawaitable(maybe) else maybe
+                    if ack:
+                        acknowledged.append(
+                            ComputerCallOutputAcknowledgedSafetyCheck(
+                                id=check.id,
+                                code=check.code,
+                                message=check.message,
+                            )
+                        )
+                    else:
+                        raise UserError("Computer tool safety check was not acknowledged")
+
             results.append(
                 await ComputerAction.execute(
                     agent=agent,
@@ -645,6 +899,7 @@ class RunImpl:
                     hooks=hooks,
                     context_wrapper=context_wrapper,
                     config=config,
+                    acknowledged_safety_checks=acknowledged,
                 )
             )
 
@@ -742,6 +997,7 @@ class RunImpl:
                     else original_input,
                     pre_handoff_items=tuple(pre_step_items),
                     new_items=tuple(new_step_items),
+                    run_context=context_wrapper,
                 )
                 if not callable(input_filter):
                     _error_tracing.attach_error_to_span(
@@ -753,6 +1009,8 @@ class RunImpl:
                     )
                     raise UserError(f"Invalid input filter: {input_filter}")
                 filtered = input_filter(handoff_input_data)
+                if inspect.isawaitable(filtered):
+                    filtered = await filtered
                 if not isinstance(filtered, HandoffInputData):
                     _error_tracing.attach_error_to_span(
                         span_handoff,
@@ -777,6 +1035,8 @@ class RunImpl:
             pre_step_items=pre_step_items,
             new_step_items=new_step_items,
             next_step=NextStepHandoff(new_agent),
+            tool_input_guardrail_results=[],
+            tool_output_guardrail_results=[],
         )
 
     @classmethod
@@ -825,6 +1085,8 @@ class RunImpl:
         final_output: Any,
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
+        tool_input_guardrail_results: list[ToolInputGuardrailResult],
+        tool_output_guardrail_results: list[ToolOutputGuardrailResult],
     ) -> SingleStepResult:
         # Run the on_end hooks
         await cls.run_final_output_hooks(agent, hooks, context_wrapper, final_output)
@@ -835,6 +1097,8 @@ class RunImpl:
             pre_step_items=pre_step_items,
             new_step_items=new_step_items,
             next_step=NextStepFinalOutput(final_output),
+            tool_input_guardrail_results=tool_input_guardrail_results,
+            tool_output_guardrail_results=tool_output_guardrail_results,
         )
 
     @classmethod
@@ -879,12 +1143,12 @@ class RunImpl:
             return result
 
     @classmethod
-    def stream_step_result_to_queue(
+    def stream_step_items_to_queue(
         cls,
-        step_result: SingleStepResult,
+        new_step_items: list[RunItem],
         queue: asyncio.Queue[StreamEvent | QueueCompleteSentinel],
     ):
-        for item in step_result.new_step_items:
+        for item in new_step_items:
             if isinstance(item, MessageOutputItem):
                 event = RunItemStreamEvent(item=item, name="message_output_created")
             elif isinstance(item, HandoffCallItem):
@@ -910,6 +1174,14 @@ class RunImpl:
                 queue.put_nowait(event)
 
     @classmethod
+    def stream_step_result_to_queue(
+        cls,
+        step_result: SingleStepResult,
+        queue: asyncio.Queue[StreamEvent | QueueCompleteSentinel],
+    ):
+        cls.stream_step_items_to_queue(step_result.new_step_items, queue)
+
+    @classmethod
     async def _check_for_final_output_from_tools(
         cls,
         *,
@@ -918,7 +1190,10 @@ class RunImpl:
         context_wrapper: RunContextWrapper[TContext],
         config: RunConfig,
     ) -> ToolsToFinalOutputResult:
-        """Returns (i, final_output)."""
+        """Determine if tool results should produce a final output.
+        Returns:
+            ToolsToFinalOutputResult: Indicates whether final output is ready, and the output value.
+        """
         if not tool_results:
             return _NOT_FINAL_OUTPUT
 
@@ -998,6 +1273,7 @@ class ComputerAction:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         config: RunConfig,
+        acknowledged_safety_checks: list[ComputerCallOutputAcknowledgedSafetyCheck] | None = None,
     ) -> RunItem:
         output_func = (
             cls._get_screenshot_async(action.computer_tool.computer, action.tool_call)
@@ -1036,6 +1312,7 @@ class ComputerAction:
                     "image_url": image_url,
                 },
                 type="computer_call_output",
+                acknowledged_safety_checks=acknowledged_safety_checks,
             ),
         )
 
@@ -1145,3 +1422,21 @@ class LocalShellAction:
                 # "id": "out" + call.tool_call.id,  # TODO remove this, it should be optional
             },
         )
+
+
+def _build_litellm_json_tool_call(output: ResponseFunctionToolCall) -> FunctionTool:
+    async def on_invoke_tool(_ctx: ToolContext[Any], value: Any) -> Any:
+        if isinstance(value, str):
+            import json
+
+            return json.loads(value)
+        return value
+
+    return FunctionTool(
+        name=output.name,
+        description=output.name,
+        params_json_schema={},
+        on_invoke_tool=on_invoke_tool,
+        strict_json_schema=True,
+        is_enabled=True,
+    )
