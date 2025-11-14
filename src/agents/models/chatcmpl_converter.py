@@ -8,6 +8,7 @@ from openai import Omit, omit
 from openai.types.chat import (
     ChatCompletionAssistantMessageParam,
     ChatCompletionContentPartImageParam,
+    ChatCompletionContentPartInputAudioParam,
     ChatCompletionContentPartParam,
     ChatCompletionContentPartTextParam,
     ChatCompletionDeveloperMessageParam,
@@ -27,6 +28,7 @@ from openai.types.responses import (
     ResponseFileSearchToolCallParam,
     ResponseFunctionToolCall,
     ResponseFunctionToolCallParam,
+    ResponseInputAudioParam,
     ResponseInputContentParam,
     ResponseInputFileParam,
     ResponseInputImageParam,
@@ -48,6 +50,8 @@ from ..items import TResponseInputItem, TResponseOutputItem
 from ..model_settings import MCPToolChoice
 from ..tool import FunctionTool, Tool
 from .fake_id import FAKE_RESPONSES_ID
+
+ResponseInputContentWithAudioParam = Union[ResponseInputContentParam, ResponseInputAudioParam]
 
 
 class Converter:
@@ -134,7 +138,9 @@ class Converter:
         )
         if message.content:
             message_item.content.append(
-                ResponseOutputText(text=message.content, type="output_text", annotations=[])
+                ResponseOutputText(
+                    text=message.content, type="output_text", annotations=[], logprobs=[]
+                )
             )
         if message.refusal:
             message_item.content.append(
@@ -244,7 +250,7 @@ class Converter:
 
     @classmethod
     def extract_text_content(
-        cls, content: str | Iterable[ResponseInputContentParam]
+        cls, content: str | Iterable[ResponseInputContentWithAudioParam]
     ) -> str | list[ChatCompletionContentPartTextParam]:
         all_content = cls.extract_all_content(content)
         if isinstance(all_content, str):
@@ -257,7 +263,7 @@ class Converter:
 
     @classmethod
     def extract_all_content(
-        cls, content: str | Iterable[ResponseInputContentParam]
+        cls, content: str | Iterable[ResponseInputContentWithAudioParam]
     ) -> str | list[ChatCompletionContentPartParam]:
         if isinstance(content, str):
             return content
@@ -284,6 +290,32 @@ class Converter:
                         image_url={
                             "url": casted_image_param["image_url"],
                             "detail": casted_image_param.get("detail", "auto"),
+                        },
+                    )
+                )
+            elif isinstance(c, dict) and c.get("type") == "input_audio":
+                casted_audio_param = cast(ResponseInputAudioParam, c)
+                audio_payload = casted_audio_param.get("input_audio")
+                if not audio_payload:
+                    raise UserError(
+                        f"Only audio data is supported for input_audio {casted_audio_param}"
+                    )
+                if not isinstance(audio_payload, dict):
+                    raise UserError(
+                        f"input_audio must provide audio data and format {casted_audio_param}"
+                    )
+                audio_data = audio_payload.get("data")
+                audio_format = audio_payload.get("format")
+                if not audio_data or not audio_format:
+                    raise UserError(
+                        f"input_audio requires both data and format {casted_audio_param}"
+                    )
+                out.append(
+                    ChatCompletionContentPartInputAudioParam(
+                        type="input_audio",
+                        input_audio={
+                            "data": audio_data,
+                            "format": audio_format,
                         },
                     )
                 )
@@ -507,7 +539,7 @@ class Converter:
             elif func_output := cls.maybe_function_tool_call_output(item):
                 flush_assistant_message()
                 output_content = cast(
-                    Union[str, Iterable[ResponseInputContentParam]], func_output["output"]
+                    Union[str, Iterable[ResponseInputContentWithAudioParam]], func_output["output"]
                 )
                 msg: ChatCompletionToolMessageParam = {
                     "role": "tool",
